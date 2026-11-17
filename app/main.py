@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import index_manager as im
-from .db import connect, wait_for_schema
+from .db import connect, ensure_schema, wait_for_schema
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,9 +21,10 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Wait for the init script, then make tracked state consistent with the
-    # actual index before serving traffic.
+    # Wait for the init script, apply additive migrations, then make tracked
+    # state consistent with the actual index before serving traffic.
     wait_for_schema()
+    ensure_schema()
     im.reconcile()
     log.info("instance %s ready", im.INSTANCE_ID)
     yield

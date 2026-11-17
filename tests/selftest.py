@@ -17,6 +17,12 @@ Runs against two live API instances and a real PostgreSQL and verifies:
   P5  startup reconcile marks the orphaned build failed; restarts keep the
       tracked state consistent with the actual index
   P6  the device/time-range query plan uses the new index
+  P7a a claimed build whose thread stalls past the lease (owner alive and
+      heartbeating) is NOT reclaimed: build/status/cleanup all agree the
+      claim keeps its eligibility, and the stalled build completes
+  P7b a frozen instance (heartbeats stopped) loses its claim after the lease;
+      the peer cleans up and takes over; when the frozen instance resumes,
+      its late build thread issues NO DDL and writes NOTHING back
 
 Modes:
   local   spawns/kills two local uvicorn processes (used in this sandbox)
@@ -30,6 +36,7 @@ Requires psycopg (project venv). Usage:
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -172,19 +179,47 @@ class LocalInstance:
             self.proc.wait()
         info(f"{self.name} killed")
 
+    def pause(self):
+        # SIGSTOP: the process is frozen (heartbeats stop, threads stall) but
+        # not dead -- simulates the "claimed, then stalled past the lease" case.
+        os.kill(self.proc.pid, signal.SIGSTOP)
+        info(f"{self.name} frozen (SIGSTOP)")
+
+    def unpause(self):
+        os.kill(self.proc.pid, signal.SIGCONT)
+        info(f"{self.name} resumed (SIGCONT)")
+
+    def log_contains(self, needle):
+        try:
+            with open(self.logpath, "rb") as f:
+                return needle.encode() in f.read()
+        except OSError:
+            return False
+
 
 class DockerInstance:
     def __init__(self, service, workdir):
         self.service, self.workdir = service, workdir
 
-    def _compose(self, *args):
-        subprocess.run(["docker", "compose", *args], cwd=self.workdir, check=True)
+    def _compose(self, *args, capture=False):
+        return subprocess.run(["docker", "compose", *args], cwd=self.workdir,
+                              check=True, capture_output=capture, text=capture)
 
     def start(self):
         self._compose("start", self.service)
 
     def kill(self):
         self._compose("kill", self.service)
+
+    def pause(self):
+        self._compose("pause", self.service)
+
+    def unpause(self):
+        self._compose("unpause", self.service)
+
+    def log_contains(self, needle):
+        out = self._compose("logs", "--no-color", self.service, capture=True)
+        return needle in out.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +576,133 @@ def phase_p6(ctx):
           code == 200 and INDEX_NAME in plan, plan[:200])
 
 
+# ---------------------------------------------------------------------------
+# P7: the claim-then-stall race
+# ---------------------------------------------------------------------------
+
+def set_pre_ddl_delay(db, seconds):
+    db.q("INSERT INTO index_build_controls (key, value) "
+         "VALUES ('pre_ddl_delay_seconds', %s) "
+         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+         (str(seconds),))
+
+
+def clear_pre_ddl_delay(db):
+    db.q("DELETE FROM index_build_controls WHERE key = 'pre_ddl_delay_seconds'")
+
+
+def phase_p7a(ctx):
+    print("\n== P7a: stalled claim, owner alive -> timeout alone must NOT "
+          "recycle it ==")
+    db = ctx["db"]
+    b1, b2 = ctx["bases"]["api1"], ctx["bases"]["api2"]
+    operator_reset(db)
+
+    # The build thread stalls BEFORE its DDL for longer than the lease, while
+    # the (alive) instance keeps heartbeating. The old grace-based logic would
+    # have recycled the claim; the lease must protect it.
+    stall = GRACE + 10
+    set_pre_ddl_delay(db, stall)
+    code, r = http("POST", b1, "/indexes/build")
+    check("P7a build claimed on api1", r.get("state") == "started", str(r))
+    job1 = r["job_id"]
+    time.sleep(3)  # the build thread has read the hook by now
+    clear_pre_ddl_delay(db)
+
+    # Let the claim age well past the lease while the thread is still stalled
+    # (no CREATE INDEX backend exists yet).
+    info(f"waiting past the lease ({GRACE + 2:.0f}s) during the stall")
+    time.sleep(GRACE + 2)
+
+    code, st = http("GET", b2, "/indexes/status")
+    check("P7a status still 'building' (not recycled by timeout)",
+          st.get("state") == "building" and st.get("job_id") == job1,
+          f"state={st.get('state')} job={st.get('job_id')}")
+    check("P7a no active build backend during the stall",
+          st.get("active_build_backends") == 0)
+
+    code, r = http("POST", b2, "/indexes/build")
+    check("P7a peer build request does not reclaim",
+          r.get("state") == "building" and r.get("job_id") == job1, str(r))
+
+    code, r = http("POST", b2, "/indexes/cleanup")
+    check("P7a cleanup refuses while the claim is eligible",
+          r.get("state") == "busy" and not r.get("cleaned"), str(r))
+
+    rows = db.q("SELECT id, status FROM index_build_jobs")
+    check("P7a still exactly one job row (the original claim)",
+          len(rows) == 1 and str(rows[0][0]) == job1
+          and rows[0][1] == "building", str(rows))
+
+    final = wait_state([b1, b2], "ready", timeout=240)
+    check("P7a stalled build eventually completed under its own claim",
+          final.get("job_id") == job1)
+    cat = index_catalog(db)
+    check("P7a catalog: exactly one valid index",
+          len(cat) == 1 and cat[0][0] and cat[0][1], str(cat))
+
+
+def phase_p7b(ctx):
+    print("\n== P7b: frozen instance -> takeover -> late thread must not "
+          "build or write back ==")
+    db = ctx["db"]
+    b1, b2 = ctx["bases"]["api1"], ctx["bases"]["api2"]
+    operator_reset(db)
+
+    # api1 claims the build, then its build thread stalls before the DDL.
+    stall = GRACE + 25
+    set_pre_ddl_delay(db, stall)
+    code, r = http("POST", b1, "/indexes/build")
+    check("P7b build claimed on api1", r.get("state") == "started", str(r))
+    job1 = r["job_id"]
+    time.sleep(3)  # build thread is now parked in the pre-DDL stall
+    clear_pre_ddl_delay(db)
+
+    # Freeze the whole instance: heartbeats stop, so the lease expires and the
+    # peer may legitimately take over.
+    ctx["instances"]["api1"].pause()
+    info(f"api1 frozen; waiting {GRACE + 3:.0f}s for the lease to expire")
+    time.sleep(GRACE + 3)
+
+    code, st = http("GET", b2, "/indexes/status")
+    check("P7b frozen claim detected as orphan -> failed",
+          st.get("state") == "failed", str(st.get("state")))
+
+    code, r = http("POST", b2, "/indexes/build")
+    check("P7b api2 takes over with a NEW job",
+          r.get("state") == "started" and r.get("job_id") not in (None, job1),
+          str(r))
+    job2 = r.get("job_id")
+    final = wait_state([b2], "ready", timeout=240)
+    check("P7b takeover build reached ready", final.get("job_id") == job2)
+
+    # Resume the frozen instance. Its stalled build thread wakes up, must
+    # notice the claim is gone and leave WITHOUT issuing DDL or writing back.
+    ctx["instances"]["api1"].unpause()
+    deadline = time.time() + stall + 60
+    aborted = False
+    while time.time() < deadline:
+        if ctx["instances"]["api1"].log_contains("claim lost before DDL"):
+            aborted = True
+            break
+        time.sleep(1)
+    check("P7b late thread backed off without issuing DDL", aborted)
+    check("P7b api1 healthy after resume", wait_health(b1, timeout=60))
+
+    time.sleep(1)
+    rows = db.q("SELECT id, status FROM index_build_jobs")
+    check("P7b late thread wrote nothing back: job row still the takeover job",
+          len(rows) == 1 and str(rows[0][0]) == job2 and rows[0][1] == "ready",
+          str(rows))
+    cat = index_catalog(db)
+    check("P7b catalog: still exactly one valid index (no duplicate DDL)",
+          len(cat) == 1 and cat[0][0] and cat[0][1], str(cat))
+    code, st = http("GET", b1, "/indexes/status")
+    check("P7b resumed api1 reports ready (consistent)",
+          st.get("state") == "ready" and st.get("job_id") == job2,
+          str(st.get("state")))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["local", "docker"], required=True)
@@ -577,6 +739,8 @@ def main():
         phase_p4(ctx)
         phase_p5(ctx)
         phase_p6(ctx)
+        phase_p7a(ctx)
+        phase_p7b(ctx)
     finally:
         passed = sum(1 for _, ok in RESULTS if ok)
         print(f"\n==== summary: {passed}/{len(RESULTS)} checks passed ====")

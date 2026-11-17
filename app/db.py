@@ -39,3 +39,24 @@ def wait_for_schema(timeout_s: int = 240) -> None:
             if time.monotonic() > deadline:
                 raise RuntimeError("database schema not ready in time") from exc
             time.sleep(min(5.0, 0.5 * attempt))
+
+
+def ensure_schema() -> None:
+    """Apply additive, idempotent migrations.
+
+    db/init.sql only runs on an empty data directory, so deployments that
+    predate a schema addition get it here instead.
+    """
+    statements = [
+        "ALTER TABLE index_build_jobs "
+        "ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        """
+        CREATE TABLE IF NOT EXISTS index_build_controls (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """,
+    ]
+    with connect(autocommit=True) as conn:
+        for stmt in statements:
+            conn.execute(stmt)
